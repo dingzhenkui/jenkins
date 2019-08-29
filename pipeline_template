@@ -1,0 +1,105 @@
+label_k8s = "slave-jenkins-${UUID.randomUUID().toString()}"
+def offlineTemplate(label, body) {
+  podTemplate(label: label, cloud: 'offline',
+        containers: [containerTemplate(name: 'jnlp', image: '192.168.26.70:5000/csdn/jenkins-mvn:v1.0.5', args: '${computer.jnlpmac} ${computer.name}')],
+        imagePullSecrets: [ 'csdnregistrykey' ],
+        volumes: [
+            nfsVolume(mountPath: '/home/jenkins/workspace/', serverAddress: '192.168.26.71', serverPath: '/data/k8s-data/build-app/', readOnly: false, privileged: true)
+        ]) {
+    body()
+}
+}
+def consul(comm, ops, key) {
+    return sh(script: "/usr/bin/consul kv ${comm} -http-addr=172.16.30.101:8500 ${ops} ${key}", returnStdout: true).trim()
+}
+def SendMsg(status) {
+    if(status == "false"){
+        context = "任务:${JOB_NAME}\\n构建结果:发布失败\\n任务ID:${BUILD_ID}\\n开始时间:${starttime}\\n耗时:${currentBuild.durationString}"
+    }else{
+        context = "任务:${JOB_NAME}\\n构建结果:发布成功\\n任务ID:${BUILD_ID}\\n开始时间:${starttime}\\n耗时:${currentBuild.durationString}"
+    }
+    def msg = """{
+        \"title\" : \"jenkins消息通知\" , \"context\" : \"${context}\" , \"tagid\" : \"39\" , \"url\" : \"${env.BUILD_URL}\"
+      }"""
+    echo(msg)
+    response = httpRequest (consoleLogResponseBody: true, 
+      contentType: 'APPLICATION_JSON_UTF8', 
+      acceptType: 'APPLICATION_JSON_UTF8',
+      httpMode: 'POST', 
+      requestBody: msg,
+      url: "http://api-devops.internal.csdn.net/api/v1/notify/sendmsg", 
+      validResponseCodes: '200')
+   return response
+}
+def branch_name = env.gitlabBranch
+starttime = new Date().format('yyyy/MM/dd HH:mm:ss')
+stage('建立任务'){
+    try{
+        offlineTemplate(label_k8s){
+            node(label_k8s) {
+                container('jnlp') {
+                    stage('获取commit'){ 
+                        def (commit_1, commit_2) = commit.split('-') 
+                        commit_id = commit_2
+                        echo commit_id
+                    }
+                    stage('拉取代码'){ 
+                        dir("${BUILD_ID}"){
+                            checkout ( [$class: 'GitSCM',
+                                branches: [[name: commit_id ]],
+                                userRemoteConfigs: [[
+                                    credentialsId: 'ab5f14a6-9d33-44ae-ae74-10370be6d791', 
+                                    url: 'git@gitlab.csdn.net:rd/psc/csdn-mini-app-server.git']]])
+                                commitid = sh(returnStdout: true, script: "git --no-pager show -s --format=%H").trim()
+                                echo commitid
+                        }
+                    }
+                    stage('开始编译'){ 
+                        
+                        dir("${BUILD_ID}"){
+    						sh "mvn clean install -Dmaven.test.skip=true"
+                        }
+                    }
+                }
+            }
+        }
+        node('master'){
+            stage('开始打包'){
+                dir("/data/web/$JOB_NAME/${BUILD_ID}/target"){
+                    sh(returnStdout: true, script: "tar zcf /data/web/repo/${JOB_NAME}/${commitid}.tgz ./${Package_Name}").trim()
+              }
+            }
+            stage('上传到OSS'){
+                sh(returnStdout: true, script: "/usr/bin/ossutil cp /data/web/repo/${JOB_NAME}/${commit_id}.tgz oss://jenkins-artifacts/${App_Dest}/ -u -f").trim()
+            }
+        // 	stage('发布至生产环境') {
+        // 	    //sh "/opt/python3/bin/ansible-playbook /etc/ansible/micro_app.yml -i /etc/ansible/hosts -l 172.16.130.33 --extra-vars 'PackageName=${Package_Name} AppDest=${App_Dest} BUILD_NUMBER=${commit_id} host=172.16.130.33'"
+        //         servers = consul("get", "-recurse", "service/nginx/gw/upstream/server").split("\n")
+        //         for (i = 0; i < servers.length; i++) {
+        //             key = servers[i].split(":")
+        //             server_name =  key[0]
+        //             server_ip = key[1] + ":" + key[2]
+        //             host = key[1]
+        //             key_01 = key[0].split("/")
+        //             server_name_01 = key_01[4]
+        //             echo "下线主机:" + host 
+        //             result = consul("delete", "", "${server_name}")
+        //             sh(returnStdout: true, script: "/usr/bin/consul kv delete -http-addr=172.16.30.101:8500 service/nginx/cms/upstream/${server_name_01}").trim()
+        //             echo result
+        //             sleep 40
+        //             echo "开始发布" + host
+        //             sh "/opt/python3/bin/ansible-playbook /etc/ansible/micro_app.yml -i /etc/ansible/hosts -l ${host} --extra-vars 'PackageName=${Package_Name} AppDest=${App_Dest} BUILD_NUMBER=${commit_id} host=${host}'"
+        //             sleep 60
+        //             echo "上线主机:" + host
+        //             result = consul("put", "", "${server_name} ${server_ip}")
+        //             sh(returnStdout: true, script: "/usr/bin/consul kv put -http-addr='172.16.30.101:8500' service/nginx/cms/upstream/${server_name_01} ${host}:8554").trim()
+        //             echo result
+        //             sleep 20     
+        //         }
+        //     }
+        }
+        SendMsg("SUCCESS")
+    }catch(all){
+        SendMsg("false")   
+    }
+}
