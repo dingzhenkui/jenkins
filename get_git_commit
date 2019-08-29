@@ -1,0 +1,13 @@
+import groovy.json.*
+import java.text.SimpleDateFormat
+
+def private_token = "mA1u8X7Q8PxrxEW-F236"
+def repository = "334"
+def response = new URL("http://gitlab.csdn.net/api/v4/projects/" + repository + "/repository/tags?private_token=" + private_token).text
+commit_list = new groovy.json.JsonSlurper().parseText(response)
+def al = []
+for (def item:commit_list.take(12)) {
+  al << item['name'] + '-'+ item['commit']['id']
+  //al << item
+} 
+return al
