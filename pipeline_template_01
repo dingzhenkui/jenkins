@@ -1,3 +1,59 @@
+label_k8s = "slave-jenkins-${UUID.randomUUID().toString()}"
+def offlineTemplate(label, body) {
+  podTemplate(label: label, cloud: 'offline',
+        containers: [containerTemplate(name: 'jnlp', image: '192.168.26.70:5000/csdn/jenkins-mvn:v1.0.5', args: '${computer.jnlpmac} ${computer.name}')],
+        imagePullSecrets: [ 'csdnregistrykey' ],
+        volumes: [
+            nfsVolume(mountPath: '/home/jenkins/workspace/', serverAddress: '192.168.26.71', serverPath: '/data/k8s-data/build-app/', readOnly: false, privileged: true)
+        ]) {
+    body()
+}
+}
+
+def GetHealth(host,domain,path="/clarify/recommend?username=qq_41591877&cookieid=10_9893341960-1554112684074-174499&clarify=fund&size=21&containclassic=true") {
+    response = httpRequest (consoleLogResponseBody: true, 
+      contentType: 'APPLICATION_JSON_UTF8', 
+      acceptType: 'APPLICATION_JSON_UTF8',
+      httpMode: 'GET', 
+      customHeaders:[[name:'Host', value:"${domain}"]],
+      url: "http://" + host + path, 
+      quiet: true,
+      timeout: 1,
+      validResponseCodes: '200:555'
+      )
+      return response.status
+}
+
+def consul(comm, ops, key) {
+    return sh(script: "/usr/bin/consul kv ${comm} -http-addr=172.16.30.101:8500 ${ops} ${key}", returnStdout: true).trim()
+}
+def Check_Server_Count(){
+    Server_Counts = sh(returnStdout: true, script: "/usr/bin/consul kv get -http-addr=172.16.30.101:8500 -recurse service/nginx/personal-new/upstream/server |wc -l").trim()
+    if(Server_Counts == "2"){
+        echo "后端服务器数量:" + Server_Counts
+    }else{
+        error "后端服务器不完整，请检查consul配置……"
+    }
+}
+def SendMsg(status) {
+    if(status == "false"){
+        context = "任务:${JOB_NAME}\\n构建结果:发布失败\\n任务ID:${BUILD_ID}\\n开始时间:${starttime}\\n耗时:${currentBuild.durationString}"
+    }else{
+        context = "任务:${JOB_NAME}\\n构建结果:发布成功\\n任务ID:${BUILD_ID}\\n开始时间:${starttime}\\n耗时:${currentBuild.durationString}"
+    }
+    def msg = """{
+        \"title\" : \"jenkins消息通知\" , \"context\" : \"${context}\" , \"tagid\" : \"39\"
+      }"""
+    echo(msg)
+    response = httpRequest (consoleLogResponseBody: true, 
+      contentType: 'APPLICATION_JSON_UTF8', 
+      acceptType: 'APPLICATION_JSON_UTF8',
+      httpMode: 'POST', 
+      requestBody: msg,
+      url: "http://api-devops.internal.csdn.net/api/v1/notify/sendmsg", 
+      validResponseCodes: '200')
+   return response
+}
 def Service_Status_Check(){
 	stage('检查服务启动状态'){
 	    mark = 0
@@ -23,4 +79,81 @@ def Service_Status_Check(){
             }
 		}
 	}
+}
+def branch_name = env.gitlabBranch
+starttime = new Date().format('yyyy/MM/dd HH:mm:ss')
+stage('检查后端服务数量'){
+    node('master'){
+        Check_Server_Count()
+    }
+}
+stage('建立任务'){
+    try{
+    	offlineTemplate(label_k8s){
+    		node(label_k8s) {
+    			container('jnlp') {
+    				stage('获取commit'){ 
+    					def (commit_1, commit_2) = commit.split('-') 
+    					commit_id = commit_2
+    					echo commit_id
+    				}
+    				stage('拉取代码'){ 
+    					dir("${BUILD_ID}"){
+    						checkout ( [$class: 'GitSCM',
+    							branches: [[name: commit_id ]],
+    							userRemoteConfigs: [[
+    								credentialsId: 'ab5f14a6-9d33-44ae-ae74-10370be6d791', 
+    								url: 'git@gitlab.csdn.net:data/personalrec.git']]])
+    							commitid = sh(returnStdout: true, script: "git --no-pager show -s --format=%H").trim()
+    							ref_branch = sh(returnStdout: true, script: "git branch -r --contains ${commitid}").trim()
+    							is_master = ref_branch.contains('master')
+    							echo commitid
+    					}
+    				}
+    				stage('检查分支'){
+                        if(is_master != true){
+                            error "非master分支不允许发布"
+                        }
+                	}
+    				stage('开始编译'){ 
+    					dir("${BUILD_ID}"){
+    						sh "mvn clean"
+    						sh "mvn package -Dmaven.test.skip=true"
+    					}
+    				}
+    			}
+    		}
+    	}
+        node('master'){
+            stage('开始打包'){
+                dir("/data/web/$JOB_NAME/${BUILD_ID}/target"){
+                    sh(returnStdout: true, script: "tar zcf /data/web/repo/${JOB_NAME}/${commitid}.tgz ./personalized_recommendation-0.0.1-SNAPSHOT.jar").trim()
+                }
+            }
+            stage('上传到OSS'){
+                sh(returnStdout: true, script: "/usr/bin/ossutil cp /data/web/repo/${JOB_NAME}/${commitid}.tgz oss://jenkins-artifacts/personalrec/ -u -f").trim()
+            }
+        	stage('发布至生产环境') {
+                servers = consul("get", "-recurse", "service/nginx/personal-new/upstream/server").split("\n")
+                for (i = 0; i < servers.length; i++) {
+                    key = servers[i].split(":")
+                    server_name =  key[0]
+                    server_ip = key[1] + ":" + key[2]
+                    host = key[1]
+					service_port = key[2]
+                    echo "下线主机:" + host
+					sleep 10
+                    result = consul("delete", "", "${server_name}")
+                    echo result
+					echo "开始发布" + host
+                    sh "/opt/python3/bin/ansible-playbook /etc/ansible/bi_publish.yml -i /etc/ansible/hosts -l ${host} --extra-vars 'PackageName=${Package_Name} AppDest=${App_Dest} BUILD_NUMBER=${commit_id} host=${host}'"
+                    sleep 5 
+					Service_Status_Check()
+                }
+            }
+        }
+        SendMsg("SUCCESS")
+    }catch(all){
+        SendMsg("false")   
+    }
 }
