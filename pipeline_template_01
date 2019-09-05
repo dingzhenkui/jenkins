@@ -1,0 +1,26 @@
+def Service_Status_Check(){
+	stage('检查服务启动状态'){
+	    mark = 0
+		for (j = 0; j < 30; j++){
+			status = GetHealth("${server_ip}","personalrec.csdn.net")
+			if(status == 200){
+                mark+=1
+                sleep 2
+                echo "第${mark}次检查，状态码:${status}"
+                while(mark==6){
+                    echo "OK"
+                    result = consul("put", "", "${server_name} ${server_ip}")
+                    sleep 10
+                    return
+                }
+            }else{
+                mark+=1
+                echo "第${mark}次检查，状态码:${status},Sevice Unavliable"
+                sleep 2
+                while(mark==25){
+                    error "服务接口异常……"
+                }
+            }
+		}
+	}
+}
